@@ -1,3 +1,14 @@
+#Folders
+Data/
+Data/Raw/
+Data/Extracted/
+Data/Clean/
+Practice work and sample data/
+
+#Data files
+*.csv
+*.zip
+
 # History files
 .Rhistory
 .Rapp.history

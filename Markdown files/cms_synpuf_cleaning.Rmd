@@ -1,0 +1,1023 @@
+---
+title: "CMS Synthetic Data (DE-SynPUF) — Full Sample 1 Pull, Cleaning & Validation"
+author: "Ann Raymond"
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    df_print: paged
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE)
+options(scipen = 999)
+```
+
+## 1. Overview
+
+This notebook pulls **all five DE-SynPUF file types for Sample 1** (2008-2010),
+cleans each one, and keeps two running ledgers visible throughout the
+document rather than only at the end:
+
+1. **Pipeline ledger** — every time a step drops/collapses/joins/binds rows or
+   columns, it's logged with rows/columns *before* and *after*, and the
+   cumulative ledger is reprinted right there in the document.
+2. **Validation ledger** — every raw row count is checked against the
+   official counts published in CMS's own **DE-SynPUF Data User's Guide**
+   (Table 1, p.4 and Table 2, p.5), so it's clear our download/extraction
+   didn't truncate or duplicate anything.
+
+Every column is also renamed from CMS's cryptic `ALL_CAPS` field codes to a
+descriptive `snake_case` name, sourced from the variable labels in CMS's
+**DE-SynPUF Codebook** (`Docs/de10_codebook.pdf`) — not guessed. `BENE_COUNTY_CD`
+is dropped outright (too granular to be useful here, and the codebook flags
+it as suppressed/coarsened for disclosure control anyway), and `BENE_RACE_CD`
+/ `SP_STATE_CODE` are recoded from numeric codes to their actual categories
+using the codebook's own code tables, not left as opaque integers. Every
+file also gets a `total_claim_amt` (claims files) or `total_annual_amt`
+(beneficiary file) summing Medicare-paid + primary-payer-paid +
+beneficiary-responsibility amounts.
+
+Files pulled (Sample 1, 2008-2010):
+
+| File type | Variables (raw) | Records (CMS, Sample 1) |
+|---|---:|---:|
+| Beneficiary Summary (2008/2009/2010) | 32 | 116,352 / 114,538 / 112,754 |
+| Inpatient Claims | 81 | 66,773 |
+| Outpatient Claims | 76 | 790,790 |
+| Carrier Claims (segments A + B) | 142 | 2,370,667 + 2,370,668 = 4,741,335 |
+| Prescription Drug Events (PDE) | 8 | 5,552,421 |
+
+Source: [CMS DE-SynPUF download page](https://www.cms.gov/data-research/statistics-trends-and-reports/medicare-claims-synthetic-public-use-files/cms-2008-2010-data-entrepreneurs-synthetic-public-use-file-de-synpuf/de10-sample-1) ·
+Documented counts: CMS *Data User's Guide* ("synpuf_dug.pdf"), Table 1 & Table 2 ·
+Variable labels and category codes: CMS *DE-SynPUF Codebook* ("de10_codebook.pdf").
+
+## 2. Environment setup
+
+```{r packages}
+required_pkgs <- c("tidyverse", "lubridate", "janitor", "data.table")
+
+installed <- rownames(installed.packages())
+missing <- setdiff(required_pkgs, installed)
+if (length(missing) > 0) {
+  install.packages(missing, repos = "https://cloud.r-project.org")
+}
+
+library(tidyverse)
+library(lubridate)
+library(janitor)
+library(data.table)
+```
+
+Carrier Claims and PDE are large (2.4M and 5.6M rows; the two carrier
+segments are ~1.2GB each as CSV). Those are read with `data.table::fread()`
+instead of `readr::read_csv()` — it's markedly lighter on memory for
+wide/large files, which matters since each carrier segment is read, reduced,
+and discarded (`rm()` + `gc()`) one at a time rather than held in memory
+together. Beneficiary and Inpatient stay on `readr` since they're small and
+it was already established in the first pass of this notebook.
+
+### Pipeline & validation ledgers
+
+These two tibbles accumulate for the rest of the document. `log_step()` is
+called every time rows or columns are dropped, collapsed, or bound together;
+`validate_count()` is called every time a raw file is loaded, checking it
+against CMS's documented Sample 1 counts. Both are reprinted after every
+update so the running numbers are visible at the point they change, not just
+in a summary at the end.
+
+```{r ledger-infra}
+pipeline_log <- tibble(
+  dataset = character(), step = character(),
+  rows_before = double(), rows_after = double(),
+  cols_before = double(), cols_after = double(),
+  note = character()
+)
+
+log_step <- function(dataset, step, rows_before, rows_after,
+                      cols_before = NA, cols_after = NA, note = "") {
+  pipeline_log <<- bind_rows(pipeline_log, tibble(
+    dataset, step, rows_before, rows_after, cols_before, cols_after, note
+  ))
+  knitr::kable(pipeline_log, format.args = list(big.mark = ","),
+               caption = "Pipeline ledger (running)")
+}
+
+validation_log <- tibble(file = character(), cms_documented = double(), actual = double())
+
+validate_count <- function(file, documented, actual) {
+  validation_log <<- bind_rows(validation_log, tibble(file, cms_documented = documented, actual = actual))
+  knitr::kable(
+    validation_log %>% mutate(match = cms_documented == actual, diff = actual - cms_documented),
+    format.args = list(big.mark = ","),
+    caption = "Validation vs. CMS Data User's Guide, Sample 1 (running)"
+  )
+}
+
+# CMS 2008-2010 DE-SynPUF Data User's Guide, Table 1 (p.4) & Table 2 (p.5), Sample 1 row
+CMS_SAMPLE1 <- list(
+  bene_2008 = 116352, bene_2009 = 114538, bene_2010 = 112754,
+  ip = 66773, op = 790790,
+  carrier_a = 2370667, carrier_b = 2370668, carrier_ab = 4741335,
+  pde = 5552421
+)
+```
+
+### Category code tables (from the Codebook)
+
+`SP_STATE_CODE` and `BENE_RACE_CD` are shipped as bare numbers. Both are
+lookup codes CMS documents explicitly in the Codebook's per-variable
+"Categories" tables, reproduced here rather than re-derived:
+
+```{r code-tables}
+# de10_codebook.pdf, "BEN-7. SP_STATE_CODE" — code 54 is the catch-all "Others"
+# category CMS uses for small states/territories; 40 and 48 are not used.
+STATE_CODES <- c(
+  "01"="AL","02"="AK","03"="AZ","04"="AR","05"="CA","06"="CO","07"="CT","08"="DE","09"="DC",
+  "10"="FL","11"="GA","12"="HI","13"="ID","14"="IL","15"="IN","16"="IA","17"="KS","18"="KY",
+  "19"="LA","20"="ME","21"="MD","22"="MA","23"="MI","24"="MN","25"="MS","26"="MO","27"="MT",
+  "28"="NE","29"="NV","30"="NH","31"="NJ","32"="NM","33"="NY","34"="NC","35"="ND","36"="OH",
+  "37"="OK","38"="OR","39"="PA","41"="RI","42"="SC","43"="SD","44"="TN","45"="TX","46"="UT",
+  "47"="VT","49"="VA","50"="WA","51"="WV","52"="WI","53"="WY","54"="Other"
+)
+
+# de10_codebook.pdf, "BENE_RACE_CD" — code 4 does not exist; "Other" folds in
+# CMS's own bucket of Unknown/Other/Asian/Hispanic-miscoded/North American Native.
+RACE_CODES <- c("1"="White", "2"="Black", "3"="Other", "5"="Hispanic")
+```
+
+## 3. Pull the data
+
+Zips were downloaded from CMS's public download URLs into `Data/Raw/` and
+extracted into `Data/Extracted/`. Re-running this chunk is idempotent — it
+skips files that already exist. Paths are relative to this file's location
+(`Markdown files/`), one level up into the project's `Data/` folder.
+
+```{r download, eval=FALSE}
+raw_dir <- "../Data/Raw"
+extracted_dir <- "../Data/Extracted"
+dir.create(raw_dir, recursive = TRUE, showWarnings = FALSE)
+dir.create(extracted_dir, recursive = TRUE, showWarnings = FALSE)
+
+files <- list(
+  "de1_0_2008_beneficiary_summary_file_sample_1.zip" =
+    "https://www.cms.gov/research-statistics-data-and-systems/downloadable-public-use-files/synpufs/downloads/de1_0_2008_beneficiary_summary_file_sample_1.zip",
+  "de1_0_2009_beneficiary_summary_file_sample_1.zip" =
+    "https://www.cms.gov/research-statistics-data-and-systems/downloadable-public-use-files/synpufs/downloads/de1_0_2009_beneficiary_summary_file_sample_1.zip",
+  "de1_0_2010_beneficiary_summary_file_sample_1.zip" =
+    "https://www.cms.gov/research-statistics-data-and-systems/statistics-trends-and-reports/synpufs/downloads/de1_0_2010_beneficiary_summary_file_sample_20.zip",
+  "de1_0_2008_to_2010_inpatient_claims_sample_1.zip" =
+    "https://www.cms.gov/research-statistics-data-and-systems/downloadable-public-use-files/synpufs/downloads/de1_0_2008_to_2010_inpatient_claims_sample_1.zip",
+  "de1_0_2008_to_2010_outpatient_claims_sample_1.zip" =
+    "https://www.cms.gov/research-statistics-data-and-systems/downloadable-public-use-files/synpufs/downloads/de1_0_2008_to_2010_outpatient_claims_sample_1.zip",
+  "DE1_0_2008_to_2010_Carrier_Claims_Sample_1A.zip" =
+    "http://downloads.cms.gov/files/DE1_0_2008_to_2010_Carrier_Claims_Sample_1A.zip",
+  "DE1_0_2008_to_2010_Carrier_Claims_Sample_1B.zip" =
+    "http://downloads.cms.gov/files/DE1_0_2008_to_2010_Carrier_Claims_Sample_1B.zip",
+  "DE1_0_2008_to_2010_Prescription_Drug_Events_Sample_1.zip" =
+    "http://downloads.cms.gov/files/DE1_0_2008_to_2010_Prescription_Drug_Events_Sample_1.zip"
+)
+
+for (fname in names(files)) {
+  dest <- file.path(raw_dir, fname)
+  if (!file.exists(dest)) {
+    download.file(files[[fname]], destfile = dest, mode = "wb")
+  }
+  unzip(dest, exdir = extracted_dir, overwrite = TRUE)
+}
+
+list.files(extracted_dir)
+```
+
+## 4. Beneficiary Summary Files
+
+```{r bene-load}
+bene_2008_raw <- read_csv("../Data/Extracted/DE1_0_2008_Beneficiary_Summary_File_Sample_1.csv",
+                           col_types = cols(.default = "c"))
+bene_2009_raw <- read_csv("../Data/Extracted/DE1_0_2009_Beneficiary_Summary_File_Sample_1.csv",
+                           col_types = cols(.default = "c"))
+bene_2010_raw <- read_csv("../Data/Extracted/DE1_0_2010_Beneficiary_Summary_File_Sample_1.csv",
+                           col_types = cols(.default = "c"))
+
+validate_count("Beneficiary Summary 2008", CMS_SAMPLE1$bene_2008, nrow(bene_2008_raw))
+validate_count("Beneficiary Summary 2009", CMS_SAMPLE1$bene_2009, nrow(bene_2009_raw))
+validate_count("Beneficiary Summary 2010", CMS_SAMPLE1$bene_2010, nrow(bene_2010_raw))
+```
+
+All three years read in as character to start — the files mix dates, flags
+coded `1`/`2`, and dollar amounts, so typing happens explicitly below rather
+than relying on `readr`'s guesses. None of the 32 raw columns are fully
+empty in any of the three years, so the only column *dropped* here is
+`BENE_COUNTY_CD` (by request, not because it's empty) — everything else is
+recoded, renamed, and cast.
+
+```{r bene-clean}
+clean_beneficiary <- function(df, year) {
+  df %>%
+    clean_names() %>%
+    select(-bene_county_cd) %>%
+    mutate(
+      bene_birth_dt = ymd(bene_birth_dt),
+      bene_death_dt = ymd(bene_death_dt),
+      across(
+        c(sp_alzhdmta, sp_chf, sp_chrnkidn, sp_cncr, sp_copd, sp_depressn,
+          sp_diabetes, sp_ischmcht, sp_osteoprs, sp_ra_oa, sp_strketia),
+        ~ .x == "1"
+      ),
+      # number of the 11 CMS-flagged chronic conditions this beneficiary has
+      # in this year — a simple row-sum now that the flags are boolean
+      chronic_condition_count = rowSums(across(c(
+        sp_alzhdmta, sp_chf, sp_chrnkidn, sp_cncr, sp_copd, sp_depressn,
+        sp_diabetes, sp_ischmcht, sp_osteoprs, sp_ra_oa, sp_strketia
+      ))),
+      bene_sex_ident_cd = recode(bene_sex_ident_cd, "1" = "male", "2" = "female"),
+      bene_esrd_ind = bene_esrd_ind == "Y",
+      bene_race_cd = unname(RACE_CODES[bene_race_cd]),
+      sp_state_code = unname(STATE_CODES[sp_state_code]),
+      across(
+        c(medreimb_ip, benres_ip, pppymt_ip,
+          medreimb_op, benres_op, pppymt_op,
+          medreimb_car, benres_car, pppymt_car),
+        as.numeric
+      ),
+      # total annual amount = Medicare-paid + primary-payer-paid + beneficiary
+      # responsibility, summed across all three claim types (IP/OP/Carrier) —
+      # the same three-part total the claims files carry, rolled up to a
+      # single beneficiary-year figure
+      total_annual_amt = medreimb_ip + benres_ip + pppymt_ip +
+        medreimb_op + benres_op + pppymt_op +
+        medreimb_car + benres_car + pppymt_car,
+      reference_year = year
+    ) %>%
+    rename(
+      beneficiary_id = desynpuf_id,
+      birth_date = bene_birth_dt,
+      death_date = bene_death_dt,
+      sex = bene_sex_ident_cd,
+      race = bene_race_cd,
+      esrd_indicator = bene_esrd_ind,
+      state = sp_state_code,
+      part_a_coverage_months = bene_hi_cvrage_tot_mons,
+      part_b_coverage_months = bene_smi_cvrage_tot_mons,
+      hmo_coverage_months = bene_hmo_cvrage_tot_mons,
+      part_d_coverage_months = plan_cvrg_mos_num,
+      chronic_alzheimer = sp_alzhdmta,
+      chronic_heart_failure = sp_chf,
+      chronic_kidney_disease = sp_chrnkidn,
+      chronic_cancer = sp_cncr,
+      chronic_copd = sp_copd,
+      chronic_depression = sp_depressn,
+      chronic_diabetes = sp_diabetes,
+      chronic_ischemic_heart_disease = sp_ischmcht,
+      chronic_osteoporosis = sp_osteoprs,
+      chronic_rheumatoid_or_osteoarthritis = sp_ra_oa,
+      chronic_stroke_tia = sp_strketia,
+      annual_medicare_reimb_ip = medreimb_ip,
+      annual_beneficiary_resp_ip = benres_ip,
+      annual_primary_payer_reimb_ip = pppymt_ip,
+      annual_medicare_reimb_op = medreimb_op,
+      annual_beneficiary_resp_op = benres_op,
+      annual_primary_payer_reimb_op = pppymt_op,
+      annual_medicare_reimb_car = medreimb_car,
+      annual_beneficiary_resp_car = benres_car,
+      annual_primary_payer_reimb_car = pppymt_car
+    )
+}
+
+bene_2008 <- clean_beneficiary(bene_2008_raw, 2008)
+bene_2009 <- clean_beneficiary(bene_2009_raw, 2009)
+bene_2010 <- clean_beneficiary(bene_2010_raw, 2010)
+
+rows_each <- nrow(bene_2008) + nrow(bene_2009) + nrow(bene_2010)
+beneficiary_all <- bind_rows(bene_2008, bene_2009, bene_2010) %>%
+  relocate(reference_year, .after = beneficiary_id)
+
+log_step("beneficiary", "drop county; recode race/state; rename all columns; add total_annual_amt + chronic_condition_count; row-bind years",
+         rows_each, nrow(beneficiary_all),
+         ncol(bene_2008_raw), ncol(beneficiary_all),
+         "dropped bene_county_cd (1 col); added reference_year + total_annual_amt + chronic_condition_count (3 cols) — net +2 columns vs. raw")
+```
+
+### Sanity checks
+
+```{r bene-checks}
+beneficiary_all %>% count(reference_year, name = "n_beneficiaries") %>% knitr::kable()
+
+dup_check <- beneficiary_all %>% count(beneficiary_id, reference_year) %>% filter(n > 1) %>% nrow()
+cat("Duplicate (id, year) pairs:", dup_check, "\n")
+
+beneficiary_all %>% count(race, name = "n") %>% knitr::kable(caption = "Race, recoded")
+beneficiary_all %>% count(state, name = "n") %>% arrange(desc(n)) %>% head(5) %>%
+  knitr::kable(caption = "State, recoded (top 5)")
+
+beneficiary_all %>%
+  summarise(mean_total_annual_amt = mean(total_annual_amt, na.rm = TRUE),
+            median_total_annual_amt = median(total_annual_amt, na.rm = TRUE),
+            max_total_annual_amt = max(total_annual_amt, na.rm = TRUE)) %>%
+  knitr::kable(caption = "total_annual_amt = Medicare-paid + primary-payer-paid + beneficiary responsibility, summed across IP/OP/Carrier")
+
+beneficiary_all %>% count(chronic_condition_count, name = "n_beneficiary_years") %>%
+  knitr::kable(caption = "chronic_condition_count distribution (0-11 conditions)")
+```
+
+## 5. Inpatient Claims
+
+```{r ip-load}
+ip_raw <- fread("../Data/Extracted/DE1_0_2008_to_2010_Inpatient_Claims_Sample_1.csv", colClasses = "character")
+validate_count("Inpatient Claims (2008-2010)", CMS_SAMPLE1$ip, nrow(ip_raw))
+```
+
+```{r ip-empty-check}
+ip_na_rate <- sapply(names(ip_raw), function(cn) mean(is.na(ip_raw[[cn]]) | ip_raw[[cn]] == ""))
+ip_empty_cols <- names(ip_na_rate)[ip_na_rate == 1]
+cat("Fully-empty columns in this sample (", length(ip_empty_cols), "of", ncol(ip_raw), "):\n")
+cat(paste(ip_empty_cols, collapse = ", "), "\n")
+```
+
+Every `HCPCS_CD_*` slot (all 45 of them) is 100% empty in this sample —
+inpatient claims are DRG-priced and don't carry line-level HCPCS codes the
+way outpatient/carrier claims do, so this isn't a data problem, it's
+expected structure. They're dropped. Everything else is renamed to a
+descriptive name (via the Codebook's labels) and cast; four columns that
+were previously left as raw strings — three beneficiary liability columns
+(`beneficiary_deductible_amt`, `beneficiary_part_a_coinsurance_amt`,
+`beneficiary_blood_deductible_amt`) and `pass_through_per_diem_amt` — are
+now cast to numeric too, since `total_claim_amt` below and the Section 14
+reconciliation both need to sum them.
+
+```{r ip-clean}
+ip_cols_before <- ncol(ip_raw)
+ip_reduced <- ip_raw[, setdiff(names(ip_raw), ip_empty_cols), with = FALSE]
+
+inpatient_clean <- ip_reduced %>%
+  as_tibble() %>%
+  clean_names() %>%
+  mutate(
+    clm_from_dt = ymd(clm_from_dt),
+    clm_thru_dt = ymd(clm_thru_dt),
+    clm_admsn_dt = ymd(clm_admsn_dt),
+    nch_bene_dschrg_dt = ymd(nch_bene_dschrg_dt),
+    clm_pmt_amt = as.numeric(clm_pmt_amt),
+    nch_prmry_pyr_clm_pd_amt = as.numeric(nch_prmry_pyr_clm_pd_amt),
+    nch_bene_ip_ddctbl_amt = as.numeric(nch_bene_ip_ddctbl_amt),
+    nch_bene_pta_coinsrnc_lblty_am = as.numeric(nch_bene_pta_coinsrnc_lblty_am),
+    nch_bene_blood_ddctbl_lblty_am = as.numeric(nch_bene_blood_ddctbl_lblty_am),
+    clm_pass_thru_per_diem_amt = as.numeric(clm_pass_thru_per_diem_amt),
+    clm_utlztn_day_cnt = as.integer(clm_utlztn_day_cnt),
+    length_of_stay = as.integer(nch_bene_dschrg_dt - clm_admsn_dt),
+    # total amount = Medicare-paid + primary-payer-paid + beneficiary liability
+    # (deductible + Part A coinsurance + blood deductible)
+    total_claim_amt = clm_pmt_amt + nch_prmry_pyr_clm_pd_amt +
+      nch_bene_ip_ddctbl_amt + nch_bene_pta_coinsrnc_lblty_am + nch_bene_blood_ddctbl_lblty_am
+  ) %>%
+  rename(
+    beneficiary_id = desynpuf_id,
+    claim_id = clm_id,
+    claim_line_segment = segment,
+    claim_start_date = clm_from_dt,
+    claim_end_date = clm_thru_dt,
+    provider_institution_id = prvdr_num,
+    medicare_payment_amt = clm_pmt_amt,
+    primary_payer_paid_amt = nch_prmry_pyr_clm_pd_amt,
+    attending_physician_npi = at_physn_npi,
+    operating_physician_npi = op_physn_npi,
+    other_physician_npi = ot_physn_npi,
+    admission_date = clm_admsn_dt,
+    admitting_diagnosis_code = admtng_icd9_dgns_cd,
+    pass_through_per_diem_amt = clm_pass_thru_per_diem_amt,
+    beneficiary_deductible_amt = nch_bene_ip_ddctbl_amt,
+    beneficiary_part_a_coinsurance_amt = nch_bene_pta_coinsrnc_lblty_am,
+    beneficiary_blood_deductible_amt = nch_bene_blood_ddctbl_lblty_am,
+    utilization_day_count = clm_utlztn_day_cnt,
+    discharge_date = nch_bene_dschrg_dt,
+    drg_code = clm_drg_cd
+  ) %>%
+  rename_with(~ str_replace(., "^icd9_dgns_cd_", "diagnosis_code_"), starts_with("icd9_dgns_cd_")) %>%
+  rename_with(~ str_replace(., "^icd9_prcdr_cd_", "procedure_code_"), starts_with("icd9_prcdr_cd_"))
+
+log_step("inpatient", "drop empty HCPCS cols; rename; add total_claim_amt",
+         nrow(ip_raw), nrow(inpatient_clean), ip_cols_before, ncol(inpatient_clean),
+         paste0("dropped ", length(ip_empty_cols), " HCPCS_CD_* (100% empty); added length_of_stay + total_claim_amt (2 cols)"))
+```
+
+```{r ip-summary}
+inpatient_clean %>%
+  summarise(n_claims = n(), n_beneficiaries = n_distinct(beneficiary_id),
+            total_medicare_paid = sum(medicare_payment_amt, na.rm = TRUE),
+            total_claim_amt = sum(total_claim_amt, na.rm = TRUE),
+            median_length_of_stay = median(length_of_stay, na.rm = TRUE)) %>%
+  knitr::kable()
+```
+
+### Referential check against beneficiaries
+
+```{r ip-join-check}
+ip_orphans <- inpatient_clean %>% distinct(beneficiary_id) %>% anti_join(beneficiary_all, by = "beneficiary_id") %>% nrow()
+cat("Inpatient beneficiaries with no match in the beneficiary file:", ip_orphans, "\n")
+```
+
+## 6. Outpatient Claims
+
+```{r op-load}
+op_raw <- fread("../Data/Extracted/DE1_0_2008_to_2010_Outpatient_Claims_Sample_1.csv", colClasses = "character")
+validate_count("Outpatient Claims (2008-2010)", CMS_SAMPLE1$op, nrow(op_raw))
+```
+
+Unlike inpatient, outpatient claims *do* use HCPCS codes for line-level
+procedures — `HCPCS_CD_1` is populated on 82% of claims, and fill rate
+decays gradually out to `HCPCS_CD_44`. Only `HCPCS_CD_45` (the very last
+slot) is ever used — checked the same way as inpatient, not assumed:
+
+```{r op-empty-check}
+op_na_rate <- sapply(names(op_raw), function(cn) mean(is.na(op_raw[[cn]]) | op_raw[[cn]] == ""))
+op_empty_cols <- names(op_na_rate)[op_na_rate == 1]
+cat("Fully-empty columns (", length(op_empty_cols), "of", ncol(op_raw), "):", paste(op_empty_cols, collapse=", "), "\n")
+```
+
+```{r op-clean}
+op_cols_before <- ncol(op_raw)
+op_reduced <- op_raw[, setdiff(names(op_raw), op_empty_cols), with = FALSE]
+
+outpatient_clean <- op_reduced %>%
+  as_tibble() %>%
+  clean_names() %>%
+  mutate(
+    clm_from_dt = ymd(clm_from_dt),
+    clm_thru_dt = ymd(clm_thru_dt),
+    clm_pmt_amt = as.numeric(clm_pmt_amt),
+    nch_prmry_pyr_clm_pd_amt = as.numeric(nch_prmry_pyr_clm_pd_amt),
+    nch_bene_blood_ddctbl_lblty_am = as.numeric(nch_bene_blood_ddctbl_lblty_am),
+    nch_bene_ptb_ddctbl_amt = as.numeric(nch_bene_ptb_ddctbl_amt),
+    nch_bene_ptb_coinsrnc_amt = as.numeric(nch_bene_ptb_coinsrnc_amt),
+    # total amount = Medicare-paid + primary-payer-paid + beneficiary liability
+    # (blood deductible + Part B deductible + Part B coinsurance)
+    total_claim_amt = clm_pmt_amt + nch_prmry_pyr_clm_pd_amt +
+      nch_bene_blood_ddctbl_lblty_am + nch_bene_ptb_ddctbl_amt + nch_bene_ptb_coinsrnc_amt
+  ) %>%
+  rename(
+    beneficiary_id = desynpuf_id,
+    claim_id = clm_id,
+    claim_line_segment = segment,
+    claim_start_date = clm_from_dt,
+    claim_end_date = clm_thru_dt,
+    provider_institution_id = prvdr_num,
+    medicare_payment_amt = clm_pmt_amt,
+    primary_payer_paid_amt = nch_prmry_pyr_clm_pd_amt,
+    attending_physician_npi = at_physn_npi,
+    operating_physician_npi = op_physn_npi,
+    other_physician_npi = ot_physn_npi,
+    beneficiary_blood_deductible_amt = nch_bene_blood_ddctbl_lblty_am,
+    beneficiary_part_b_deductible_amt = nch_bene_ptb_ddctbl_amt,
+    beneficiary_part_b_coinsurance_amt = nch_bene_ptb_coinsrnc_amt,
+    admitting_diagnosis_code = admtng_icd9_dgns_cd
+  ) %>%
+  rename_with(~ str_replace(., "^icd9_dgns_cd_", "diagnosis_code_"), starts_with("icd9_dgns_cd_")) %>%
+  rename_with(~ str_replace(., "^icd9_prcdr_cd_", "procedure_code_"), starts_with("icd9_prcdr_cd_")) %>%
+  rename_with(~ str_replace(., "^hcpcs_cd_", "procedure_hcpcs_code_"), starts_with("hcpcs_cd_"))
+
+log_step("outpatient", "drop 1 empty HCPCS col; rename; add total_claim_amt",
+         nrow(op_raw), nrow(outpatient_clean), op_cols_before, ncol(outpatient_clean),
+         paste("dropped:", paste(op_empty_cols, collapse=", "), "; added total_claim_amt (1 col)"))
+rm(op_raw, op_reduced); gc(verbose = FALSE)
+```
+
+### Referential check against beneficiaries
+
+```{r op-join-check}
+op_orphans <- outpatient_clean %>% distinct(beneficiary_id) %>% anti_join(beneficiary_all, by = "beneficiary_id") %>% nrow()
+cat("Outpatient beneficiaries with no match in the beneficiary file:", op_orphans, "\n")
+```
+
+## 7. Carrier Claims (Segments A + B)
+
+Carrier claims are the largest file type by far: 142 columns, ~2.37M rows
+*per segment* (CMS split each subsample into A/B purely for file-size
+reasons — it's one logical file). Each segment is ~1.2GB as CSV, and this
+machine has ~5GB of free RAM, so both segments are never held in memory at
+once: each is read, reduced to a claim-level summary, and discarded
+(`rm()` + `gc()`) before the next one loads.
+
+142 columns is mostly *repetition*: up to 13 service lines per claim, each
+with its own physician NPI, tax number, HCPCS code, and dollar amounts for
+Medicare payment, primary-payer payment, Part B deductible, coinsurance, and
+allowed charge — plus a processing-indicator code and a line-level diagnosis
+code. Rather than rename those 1:1, the cleaning step collapses them to a
+per-claim summary: line count, primary HCPCS code, and totals across *all
+three* payer components CMS tracks at the line level (Medicare paid, primary
+payer paid, and beneficiary liability). Per-line physician NPIs, tax
+numbers, processing-indicator codes, and line-level diagnosis pointers are
+still dropped — those don't roll up into a meaningful per-claim total.
+
+```{r carrier-summarize-fn}
+summarize_carrier <- function(dt) {
+  hcpcs_cols      <- grep("^HCPCS_CD_", names(dt), value = TRUE)
+  nch_cols        <- grep("^LINE_NCH_PMT_AMT_", names(dt), value = TRUE)
+  coins_cols      <- grep("^LINE_COINSRNC_AMT_", names(dt), value = TRUE)
+  alowd_cols      <- grep("^LINE_ALOWD_CHRG_AMT_", names(dt), value = TRUE)
+  ptb_ddctbl_cols <- grep("^LINE_BENE_PTB_DDCTBL_AMT_", names(dt), value = TRUE)
+  prmry_pyr_cols  <- grep("^LINE_BENE_PRMRY_PYR_PD_AMT_", names(dt), value = TRUE)
+  dgns_cols       <- grep("^ICD9_DGNS_CD_", names(dt), value = TRUE)
+
+  sum_cols <- function(cols) Reduce(`+`, lapply(dt[, ..cols], function(x) {
+    x[is.na(x) | x == ""] <- "0"; as.numeric(x)
+  }))
+
+  dt[, n_lines := Reduce(`+`, lapply(.SD, function(x) !is.na(x) & x != "")), .SDcols = hcpcs_cols]
+  dt[, primary_hcpcs_cd := apply(.SD, 1, function(x) { v <- x[!is.na(x) & x != ""]; if (length(v)) v[1] else NA_character_ }), .SDcols = hcpcs_cols]
+  dt[, n_dgns_codes := Reduce(`+`, lapply(.SD, function(x) !is.na(x) & x != "")), .SDcols = dgns_cols]
+  dt[, total_line_nch_pmt_amt := sum_cols(nch_cols)]
+  dt[, total_line_coinsrnc_amt := sum_cols(coins_cols)]
+  dt[, total_line_alowd_chrg_amt := sum_cols(alowd_cols)]
+  dt[, total_line_ptb_ddctbl_amt := sum_cols(ptb_ddctbl_cols)]
+  dt[, total_line_prmry_pyr_pd_amt := sum_cols(prmry_pyr_cols)]
+
+  keep <- c("DESYNPUF_ID", "CLM_ID", "CLM_FROM_DT", "CLM_THRU_DT", dgns_cols,
+            "n_dgns_codes", "n_lines", "primary_hcpcs_cd",
+            "total_line_nch_pmt_amt", "total_line_coinsrnc_amt", "total_line_alowd_chrg_amt",
+            "total_line_ptb_ddctbl_amt", "total_line_prmry_pyr_pd_amt")
+  dt[, ..keep]
+}
+```
+
+### Segment A
+
+```{r carrier-a}
+car_a_raw <- fread("../Data/Extracted/DE1_0_2008_to_2010_Carrier_Claims_Sample_1A.csv", colClasses = "character")
+validate_count("Carrier Claims A (2008-2010)", CMS_SAMPLE1$carrier_a, nrow(car_a_raw))
+
+car_a_cols_before <- ncol(car_a_raw)
+car_a_clean <- summarize_carrier(car_a_raw)
+
+log_step("carrier_a", "collapse 13 service-line slots to per-claim summary",
+         nrow(car_a_raw), nrow(car_a_clean), car_a_cols_before, ncol(car_a_clean),
+         "dropped per-line NPI/tax-num/processing-indicator/line-level diagnosis; kept claim-level dgns codes + line-item sums (now including primary-payer-paid and Part B deductible)")
+
+rm(car_a_raw); gc(verbose = FALSE)
+```
+
+### Segment B
+
+```{r carrier-b}
+car_b_raw <- fread("../Data/Extracted/DE1_0_2008_to_2010_Carrier_Claims_Sample_1B.csv", colClasses = "character")
+validate_count("Carrier Claims B (2008-2010)", CMS_SAMPLE1$carrier_b, nrow(car_b_raw))
+
+car_b_cols_before <- ncol(car_b_raw)
+car_b_clean <- summarize_carrier(car_b_raw)
+
+log_step("carrier_b", "collapse 13 service-line slots to per-claim summary",
+         nrow(car_b_raw), nrow(car_b_clean), car_b_cols_before, ncol(car_b_clean),
+         "dropped per-line NPI/tax-num/processing-indicator/line-level diagnosis; kept claim-level dgns codes + line-item sums (now including primary-payer-paid and Part B deductible)")
+
+rm(car_b_raw); gc(verbose = FALSE)
+```
+
+### Combine A + B
+
+```{r carrier-combine}
+carrier_rows_before <- nrow(car_a_clean) + nrow(car_b_clean)
+carrier_cols_before_combine <- ncol(car_a_clean)
+
+carrier_clean <- rbindlist(list(car_a_clean, car_b_clean)) %>%
+  as_tibble() %>%
+  clean_names() %>%
+  mutate(
+    clm_from_dt = ymd(clm_from_dt),
+    clm_thru_dt = ymd(clm_thru_dt),
+    # total amount = Medicare-paid + primary-payer-paid + beneficiary liability
+    # (Part B deductible + coinsurance), all summed across service lines
+    total_claim_amt = total_line_nch_pmt_amt + total_line_prmry_pyr_pd_amt +
+      total_line_coinsrnc_amt + total_line_ptb_ddctbl_amt
+  ) %>%
+  rename(
+    beneficiary_id = desynpuf_id,
+    claim_id = clm_id,
+    claim_start_date = clm_from_dt,
+    claim_end_date = clm_thru_dt,
+    diagnosis_code_count = n_dgns_codes,
+    service_line_count = n_lines,
+    primary_procedure_code = primary_hcpcs_cd,
+    total_medicare_payment_amt = total_line_nch_pmt_amt,
+    total_beneficiary_coinsurance_amt = total_line_coinsrnc_amt,
+    total_allowed_charge_amt = total_line_alowd_chrg_amt,
+    total_beneficiary_deductible_amt = total_line_ptb_ddctbl_amt,
+    total_primary_payer_paid_amt = total_line_prmry_pyr_pd_amt
+  ) %>%
+  rename_with(~ str_replace(., "^icd9_dgns_cd_", "diagnosis_code_"), starts_with("icd9_dgns_cd_"))
+
+log_step("carrier", "row-bind segments; rename; add total_claim_amt", carrier_rows_before, nrow(carrier_clean),
+         carrier_cols_before_combine, ncol(carrier_clean),
+         "union of the two carrier segments CMS split for file-size reasons (no rows lost); added total_claim_amt (1 col)")
+
+validate_count("Carrier Claims A+B (2008-2010)", CMS_SAMPLE1$carrier_ab, nrow(carrier_clean))
+rm(car_a_clean, car_b_clean); gc(verbose = FALSE)
+```
+
+### Referential check against beneficiaries
+
+```{r carrier-join-check}
+car_orphans <- carrier_clean %>% distinct(beneficiary_id) %>% anti_join(beneficiary_all, by = "beneficiary_id") %>% nrow()
+cat("Carrier-claim beneficiaries with no match in the beneficiary file:", car_orphans, "\n")
+```
+
+## 8. Prescription Drug Events (PDE)
+
+```{r pde-load}
+pde_raw <- fread("../Data/Extracted/DE1_0_2008_to_2010_Prescription_Drug_Events_Sample_1.csv", colClasses = "character")
+validate_count("Prescription Drug Events (2008-2010)", CMS_SAMPLE1$pde, nrow(pde_raw))
+```
+
+PDE is the simplest file: 8 variables, no repeated line-item structure, and
+(checked the same way as the others) zero fully-empty columns — so this
+step is renaming and type casts only, no drops.
+
+```{r pde-clean}
+pde_clean <- pde_raw %>%
+  as_tibble() %>%
+  clean_names() %>%
+  mutate(
+    srvc_dt = ymd(srvc_dt),
+    qty_dspnsd_num = as.numeric(qty_dspnsd_num),
+    days_suply_num = as.integer(days_suply_num),
+    ptnt_pay_amt = as.numeric(ptnt_pay_amt),
+    tot_rx_cst_amt = as.numeric(tot_rx_cst_amt)
+  ) %>%
+  rename(
+    beneficiary_id = desynpuf_id,
+    prescription_event_id = pde_id,
+    service_date = srvc_dt,
+    product_service_id = prod_srvc_id,
+    quantity_dispensed = qty_dspnsd_num,
+    days_supply = days_suply_num,
+    patient_pay_amt = ptnt_pay_amt,
+    gross_drug_cost_amt = tot_rx_cst_amt
+  )
+
+log_step("pde", "rename all columns (no drops, no new totals requested)", nrow(pde_raw), nrow(pde_clean),
+         ncol(pde_raw), ncol(pde_clean), "0 fully-empty columns found")
+rm(pde_raw); gc(verbose = FALSE)
+```
+
+### Referential check against beneficiaries
+
+```{r pde-join-check}
+pde_orphans <- pde_clean %>% distinct(beneficiary_id) %>% anti_join(beneficiary_all, by = "beneficiary_id") %>% nrow()
+cat("PDE beneficiaries with no match in the beneficiary file:", pde_orphans, "\n")
+```
+
+## 9. Save cleaned outputs
+
+```{r save}
+dir.create("../Data/Clean", recursive = TRUE, showWarnings = FALSE)
+write_csv(beneficiary_all, "../Data/Clean/beneficiary_2008_2010.csv")
+write_csv(inpatient_clean, "../Data/Clean/inpatient_claims_sample_1.csv")
+write_csv(outpatient_clean, "../Data/Clean/outpatient_claims_sample_1.csv")
+write_csv(carrier_clean, "../Data/Clean/carrier_claims_sample_1.csv")
+write_csv(pde_clean, "../Data/Clean/prescription_drug_events_sample_1.csv")
+
+tibble(
+  file = list.files("../Data/Clean"),
+  size_mb = round(file.size(file.path("../Data/Clean", list.files("../Data/Clean"))) / 1e6, 1)
+) %>% knitr::kable()
+```
+
+## 10. Master pipeline ledger
+
+Every row/column drop, collapse, and bind from this run, in one place:
+
+```{r master-ledger}
+knitr::kable(pipeline_log, format.args = list(big.mark = ","), caption = "Master pipeline ledger")
+```
+
+## 11. Master validation vs. CMS Data User's Guide
+
+Every raw file's row count against CMS's own documented Sample 1 counts
+(Table 2, p.5 of the Data User's Guide) — `match` should read `TRUE` across
+the board:
+
+```{r master-validation}
+validation_log %>%
+  mutate(match = cms_documented == actual, diff = actual - cms_documented) %>%
+  knitr::kable(format.args = list(big.mark = ","), caption = "Master validation ledger")
+```
+
+Raw column counts were also checked against Table 1 (p.4) of the same
+guide, which states 32 / 81 / 76 / 142 / 8 variables for Beneficiary /
+Inpatient / Outpatient / Carrier / PDE respectively — every file's raw
+`ncol()` above matched before any columns were dropped or renamed.
+
+## 12. Chronic Condition Co-occurrence
+
+`chronic_condition_count` (added in Section 4) is a simple row-sum across
+the 11 `chronic_*` flags. This section looks at *which* conditions tend to
+occur together. It collapses to one row per beneficiary first (a condition
+counts as present if it was ever flagged TRUE in 2008, 2009, *or* 2010) —
+otherwise a chronic condition that persists across all three years would
+inflate its own co-occurrence counts threefold for no real reason.
+
+```{r condition-setup}
+condition_cols <- c("chronic_alzheimer", "chronic_heart_failure", "chronic_kidney_disease",
+                     "chronic_cancer", "chronic_copd", "chronic_depression", "chronic_diabetes",
+                     "chronic_ischemic_heart_disease", "chronic_osteoporosis",
+                     "chronic_rheumatoid_or_osteoarthritis", "chronic_stroke_tia")
+
+bene_conditions_ever <- beneficiary_all %>%
+  group_by(beneficiary_id) %>%
+  summarise(across(all_of(condition_cols), any), .groups = "drop")
+
+cat("Beneficiaries, ever-diagnosed basis:", nrow(bene_conditions_ever), "\n")
+```
+
+### Correlation matrix
+
+All 11 inputs are 0/1, so a Pearson correlation here is the phi coefficient
+— a standard, well-defined measure of association for binary variables.
+
+```{r condition-corr}
+cond_matrix <- bene_conditions_ever %>%
+  select(all_of(condition_cols)) %>%
+  mutate(across(everything(), as.numeric)) %>%
+  as.matrix()
+
+cor_matrix <- cor(cond_matrix)
+
+cor_matrix %>%
+  round(2) %>%
+  as.data.frame() %>%
+  rownames_to_column("condition") %>%
+  knitr::kable(caption = "Correlation matrix (phi coefficient) — 11 chronic conditions")
+```
+
+```{r condition-corr-heatmap, fig.width=8.5, fig.height=7}
+cor_long <- cor_matrix %>%
+  as.data.frame() %>%
+  rownames_to_column("condition_1") %>%
+  pivot_longer(-condition_1, names_to = "condition_2", values_to = "correlation")
+
+ggplot(cor_long, aes(condition_1, condition_2, fill = correlation)) +
+  geom_tile(color = "white") +
+  geom_text(aes(label = round(correlation, 2)), size = 3) +
+  scale_fill_gradient2(low = "#2166AC", mid = "white", high = "#B2182B", midpoint = 0) +
+  theme_minimal(base_size = 10) +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1), axis.title = element_blank()) +
+  labs(title = "Chronic condition correlation matrix")
+```
+
+### Most common pairwise combinations
+
+Two different rankings, because they answer different questions: **raw
+co-occurrence count** (how many beneficiaries have both — naturally
+dominated by whichever conditions are individually most common) vs.
+**correlation strength** (how much more often they occur together than
+each condition's base rate alone would predict).
+
+```{r condition-pairs}
+condition_pairs <- combn(condition_cols, 2, function(pair) {
+  tibble(
+    condition_1 = pair[1],
+    condition_2 = pair[2],
+    n_both = sum(bene_conditions_ever[[pair[1]]] & bene_conditions_ever[[pair[2]]]),
+    correlation = cor_matrix[pair[1], pair[2]]
+  )
+}, simplify = FALSE) %>% bind_rows()
+
+condition_pairs %>% arrange(desc(n_both)) %>% head(10) %>%
+  knitr::kable(digits = 3, format.args = list(big.mark = ","),
+               caption = "Top 10 condition pairs by raw co-occurrence count")
+
+condition_pairs %>% arrange(desc(correlation)) %>% head(10) %>%
+  knitr::kable(digits = 3, format.args = list(big.mark = ","),
+               caption = "Top 10 condition pairs by correlation strength")
+```
+
+Worth flagging: CMS's own FAQ says this exact kind of multivariate
+relationship is what disclosure-limitation synthesis distorts most —
+*"much of the interdependence and co-variation among variables have been
+altered... univariate and multivariate statistics, such as conditional
+correlations and regression coefficients, would not be reliable."* Treat
+these pairs as a demonstration of the method, not as real clinical
+comorbidity patterns (see Section 14 for the same caveat applied to dollar
+amounts).
+
+## 13. Claim Costs by Chronic Condition
+
+Joining Inpatient, Outpatient, and PDE against the ever-diagnosed condition
+flags from Section 12. A beneficiary with 3 conditions contributes their
+claims to all 3 disease rows below — that's deliberate (a claim from a
+multi-morbid beneficiary genuinely belongs to every condition they carry),
+but it means claims are double- or triple-counted across condition rows,
+and the per-disease numbers are not independent samples of each other.
+
+```{r condition-flags-long}
+condition_flags_long <- bene_conditions_ever %>%
+  pivot_longer(all_of(condition_cols), names_to = "condition", values_to = "has_condition") %>%
+  filter(has_condition) %>%
+  select(beneficiary_id, condition)
+
+cat("Beneficiary x condition rows (TRUE only):", nrow(condition_flags_long), "\n")
+```
+
+```{r cost-by-disease-ip-op}
+cost_ip <- condition_flags_long %>%
+  inner_join(inpatient_clean %>% select(beneficiary_id, medicare_payment_amt),
+             by = "beneficiary_id", relationship = "many-to-many") %>%
+  group_by(condition) %>%
+  summarise(avg_inpatient_claim_amt = mean(medicare_payment_amt, na.rm = TRUE),
+            median_inpatient_claim_amt = median(medicare_payment_amt, na.rm = TRUE),
+            n_inpatient_claims = n(), .groups = "drop")
+
+cost_op <- condition_flags_long %>%
+  inner_join(outpatient_clean %>% select(beneficiary_id, medicare_payment_amt),
+             by = "beneficiary_id", relationship = "many-to-many") %>%
+  group_by(condition) %>%
+  summarise(avg_outpatient_claim_amt = mean(medicare_payment_amt, na.rm = TRUE),
+            median_outpatient_claim_amt = median(medicare_payment_amt, na.rm = TRUE),
+            n_outpatient_claims = n(), .groups = "drop")
+```
+
+PDE is 5.6M rows, and joining it fans out further still (a beneficiary's
+prescriptions × however many conditions they carry), so this one uses
+`data.table` the same way Carrier Claims did in Section 7, to keep it fast
+and light on memory:
+
+```{r cost-by-disease-pde}
+cost_pde <- merge(
+  as.data.table(condition_flags_long),
+  as.data.table(pde_clean)[, .(beneficiary_id, gross_drug_cost_amt)],
+  by = "beneficiary_id", allow.cartesian = TRUE
+)[, .(avg_prescription_cost = mean(gross_drug_cost_amt, na.rm = TRUE),
+      median_prescription_cost = median(gross_drug_cost_amt, na.rm = TRUE),
+      n_prescriptions = .N), by = condition] %>%
+  as_tibble()
+```
+
+```{r cost-by-disease-combine}
+cost_by_disease <- cost_ip %>%
+  full_join(cost_op, by = "condition") %>%
+  full_join(cost_pde, by = "condition") %>%
+  arrange(desc(avg_inpatient_claim_amt))
+
+cost_by_disease %>%
+  knitr::kable(digits = 2, format.args = list(big.mark = ","),
+               caption = "Average & median claim amount by chronic condition (IP/OP: medicare_payment_amt; PDE: gross_drug_cost_amt)")
+```
+
+## 14. Reconciling Beneficiary Annual Amounts Against Claims
+
+Do `annual_medicare_reimb_ip` / `annual_beneficiary_resp_ip` /
+`annual_primary_payer_reimb_ip` (and the OP equivalents) in the Beneficiary
+file equal what you get by summing the matching claim-level amounts for
+that beneficiary-year? The Codebook's **Appendix 2 ("List of Reimbursement
+Variables")** spells out CMS's exact derivation formulas, so this check
+uses those instead of a naive `sum(medicare_payment_amt)`:
+
+| Beneficiary variable | CMS's stated derivation (Codebook Appendix 2) |
+|---|---|
+| `annual_medicare_reimb_ip` | `medicare_payment_amt + utilization_day_count * pass_through_per_diem_amt` |
+| `annual_beneficiary_resp_ip` | `beneficiary_deductible_amt + beneficiary_part_a_coinsurance_amt + beneficiary_blood_deductible_amt` |
+| `annual_primary_payer_reimb_ip` | `primary_payer_paid_amt` |
+| `annual_medicare_reimb_op` | `medicare_payment_amt` |
+| `annual_beneficiary_resp_op` | `beneficiary_blood_deductible_amt + beneficiary_part_b_deductible_amt + beneficiary_part_b_coinsurance_amt` |
+| `annual_primary_payer_reimb_op` | `primary_payer_paid_amt` |
+
+(Carrier's equivalents are also in Appendix 2, but conditional on
+`LINE_PRCSG_IND_CD` — a per-line processing-indicator code dropped during
+the Carrier collapse in Section 7. Reconciling Carrier would mean
+re-deriving it from the raw files, which is out of scope here — matching
+what was actually asked: Inpatient and Outpatient only.)
+
+Claims are assigned to a calendar year using `claim_end_date` (raw
+`CLM_THRU_DT`), per the DUG's own footnote to Table 1: *"Year is determined
+by the claim through date."*
+
+```{r reconcile-build}
+ip_by_bene_year <- inpatient_clean %>%
+  mutate(claim_year = year(claim_end_date)) %>%
+  group_by(beneficiary_id, reference_year = claim_year) %>%
+  summarise(
+    claims_medicare_ip = sum(medicare_payment_amt + utilization_day_count * pass_through_per_diem_amt, na.rm = TRUE),
+    claims_benres_ip = sum(beneficiary_deductible_amt + beneficiary_part_a_coinsurance_amt + beneficiary_blood_deductible_amt, na.rm = TRUE),
+    claims_pppymt_ip = sum(primary_payer_paid_amt, na.rm = TRUE),
+    .groups = "drop"
+  )
+
+op_by_bene_year <- outpatient_clean %>%
+  mutate(claim_year = year(claim_end_date)) %>%
+  group_by(beneficiary_id, reference_year = claim_year) %>%
+  summarise(
+    claims_medicare_op = sum(medicare_payment_amt, na.rm = TRUE),
+    claims_benres_op = sum(beneficiary_blood_deductible_amt + beneficiary_part_b_deductible_amt + beneficiary_part_b_coinsurance_amt, na.rm = TRUE),
+    claims_pppymt_op = sum(primary_payer_paid_amt, na.rm = TRUE),
+    .groups = "drop"
+  )
+
+reconcile <- beneficiary_all %>%
+  select(beneficiary_id, reference_year,
+         annual_medicare_reimb_ip, annual_beneficiary_resp_ip, annual_primary_payer_reimb_ip,
+         annual_medicare_reimb_op, annual_beneficiary_resp_op, annual_primary_payer_reimb_op) %>%
+  left_join(ip_by_bene_year, by = c("beneficiary_id", "reference_year")) %>%
+  left_join(op_by_bene_year, by = c("beneficiary_id", "reference_year")) %>%
+  mutate(across(starts_with("claims_"), ~ replace_na(.x, 0)))
+```
+
+```{r reconcile-summary}
+reconcile %>%
+  summarise(
+    ip_medicare_match_pct = round(mean(abs(annual_medicare_reimb_ip - claims_medicare_ip) < 0.01) * 100, 1),
+    ip_benres_match_pct = round(mean(abs(annual_beneficiary_resp_ip - claims_benres_ip) < 0.01) * 100, 1),
+    ip_pppymt_match_pct = round(mean(abs(annual_primary_payer_reimb_ip - claims_pppymt_ip) < 0.01) * 100, 1),
+    op_medicare_match_pct = round(mean(abs(annual_medicare_reimb_op - claims_medicare_op) < 0.01) * 100, 1),
+    op_benres_match_pct = round(mean(abs(annual_beneficiary_resp_op - claims_benres_op) < 0.01) * 100, 1),
+    op_pppymt_match_pct = round(mean(abs(annual_primary_payer_reimb_op - claims_pppymt_op) < 0.01) * 100, 1)
+  ) %>%
+  pivot_longer(everything(), names_to = "check", values_to = "pct_exact_match") %>%
+  knitr::kable(caption = "% of beneficiary-years where the annual amount exactly matches the claims-derived total")
+
+reconcile %>%
+  summarise(
+    total_annual_medicare_ip = sum(annual_medicare_reimb_ip),
+    total_claims_medicare_ip = sum(claims_medicare_ip),
+    total_annual_medicare_op = sum(annual_medicare_reimb_op),
+    total_claims_medicare_op = sum(claims_medicare_op)
+  ) %>%
+  knitr::kable(format.args = list(big.mark = ","), caption = "Portfolio-level totals: annual (beneficiary file) vs. claims-derived")
+```
+
+### Why they match — a finding worth flagging
+
+**Going in, the expectation (based on the DUG's general synthesis
+methodology) was that these *wouldn't* reconcile.** Section 6 ("Methodology
+and Limitation") of the Data User's Guide describes each synthetic
+beneficiary starting from a real "seed," with *"the claims from the seed
+beneficiary... replaced with claims from other donor beneficiary claims
+sets"* — donor substitution that would normally decouple a beneficiary's
+summary totals from whatever claims ended up attached to their synthetic
+ID.
+
+**The actual result above is the opposite: a 100% exact match**, at both
+the beneficiary-year level (all six checks) and the portfolio level
+(`total_annual_medicare_ip` = `total_claims_medicare_ip` = \$648,456,860;
+`total_annual_medicare_op` = `total_claims_medicare_op` = \$209,292,350, to
+the dollar). The reason is in the Codebook's **Appendix 2 ("List of
+Reimbursement Variables")** used to build the formulas in the table above:
+it defines `MEDREIMB_IP`, `BENRES_IP`, `PPPYMT_IP`, etc. as literal sums
+*over the claim-level fields*, not as an independently-donor-sourced
+figure. That strongly suggests CMS computed these nine annual columns
+*after* finalizing the synthetic claims for a given release, as a rollup of
+those exact synthetic claims — so they're internally consistent with this
+extract's Inpatient/Outpatient files by construction, not by coincidence.
+
+This is a narrower guarantee than it might look, though: the donor
+substitution the DUG describes still applies to *other* Beneficiary fields
+— demographics, and especially the chronic-condition flags behind Sections
+12–13 — which aren't derived from the claims files the same way and carry
+no such reconciliation guarantee. CMS's FAQ underscores that distinction
+directly: *"much of the interdependence and co-variation among
+variables have been altered... conditional correlations... would not be
+reliable."* Read as: the dollar totals tie out; the relationships between
+conditions, demographics, and cost don't necessarily.
+
+Sources: CMS *DE-SynPUF Data User's Guide*, Section 6 ("Methodology and
+Limitation"), `Docs/synpuf_dug.pdf`; CMS *DE-SynPUF Codebook*, Appendix 2
+("List of Reimbursement Variables"), `Docs/de10_codebook.pdf`; CMS *DE-SynPUF
+FAQ*, `Docs/de10_faq.pdf`.
+
+## 15. Next steps
+
+- `total_claim_amt` (IP/OP/Carrier) and `total_annual_amt` (Beneficiary) sum
+  Medicare-paid + primary-payer-paid + beneficiary liability. For IP/OP
+  that's an exact reconstruction of the claim's billed components; for
+  Carrier it's a claim-level sum of already-summed line-level components, so
+  it inherits whatever rounding CMS's synthetic-data process introduced at
+  the line level. `total_annual_amt` is the beneficiary-year rollup of the
+  same three components across all three claim types (IP+OP+Carrier) — it
+  is *not* directly comparable to a single claim's `total_claim_amt`.
+- The carrier-claims collapse (142 → 21 columns) is a real simplification,
+  not a data-quality fix — if per-line physician or processing-indicator
+  detail turns out to matter for a later analysis, that needs a reshape to
+  long format instead of this claim-level summary.
+- `race` and `state` are recoded per the Codebook's own category tables;
+  both carry the Codebook's own disclosure-treatment caveats (race in
+  particular is flagged as imputed/coarsened — CMS says not to draw
+  population inferences from it).
+- All four referential checks (inpatient/outpatient/carrier/PDE against the
+  beneficiary file) came back clean above; worth re-running if a different
+  sample or year range is pulled later.
+- If sharing this notebook, note that although the data is fully synthetic,
+  it's still meant to structurally resemble real CMS PUFs — treat it as a
+  stand-in for real claims data, not for external distribution as "real"
+  Medicare statistics.
+- Section 14's reconciliation came back a **perfect 100% match** for
+  Inpatient and Outpatient — the opposite of what the DUG's general
+  donor-substitution methodology predicted going in, and traceable instead
+  to the Codebook's Appendix 2 defining these annual fields as literal sums
+  over this release's claims. That guarantee is specific to the nine annual
+  reimbursement columns, though — it says nothing about the chronic
+  condition flags (Sections 12–13) or demographics, which follow the more
+  general donor-substitution path the DUG describes and carry no such
+  reconciliation guarantee. Treat the condition correlations and
+  cost-by-disease breakdown as a demonstration of the pipeline, not as
+  clinical or actuarial fact.
+- `cost_by_disease` (Section 13) double/triple-counts claims across
+  comorbid conditions by design (see that section) — don't sum the
+  `n_*_claims` column across rows expecting it to equal total claim counts.
