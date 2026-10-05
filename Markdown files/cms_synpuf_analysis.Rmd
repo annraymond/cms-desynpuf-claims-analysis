@@ -1,0 +1,414 @@
+---
+title: "CMS Synthetic Data (DE-SynPUF) — Chronic Condition & Cost Analysis"
+author: "Ann Raymond"
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    df_print: paged
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE)
+options(scipen = 999)
+```
+
+## 1. Overview
+
+This notebook picks up where **`cms_synpuf_cleaning.Rmd`** leaves off: it
+reads four of the five cleaned CSVs that notebook saves to `Data/Clean/`
+(Beneficiary, Inpatient, Outpatient, and PDE; Carrier isn't used here) and does
+three pieces of downstream analysis on them —
+
+1. **Chronic Condition Prevalence & Correlations** — how common each of the
+   11 CMS-flagged chronic conditions is, and a heatmap of their pairwise
+   correlations.
+2. **Claim Costs by Chronic Condition** — total claim amounts across all
+   payers for Inpatient, Outpatient, and Prescription Drug Event claims,
+   among beneficiaries with each condition (joined to the Beneficiary
+   file's condition flags).
+3. **Reconciling Beneficiary Annual Amounts Against Claims** — whether the
+   Beneficiary file's annual reimbursement totals tie out against what's
+   actually in the Inpatient/Outpatient claims files, using CMS's own
+   documented derivation formulas.
+
+It does not re-pull or re-clean anything — if the CSVs in `Data/Clean/`
+aren't there yet (or are stale), run `cms_synpuf_cleaning.Rmd` first.
+
+## 2. Setup & load cleaned data
+
+```{r packages}
+required_pkgs <- c("tidyverse", "lubridate", "data.table")
+
+installed <- rownames(installed.packages())
+missing <- setdiff(required_pkgs, installed)
+if (length(missing) > 0) {
+  install.packages(missing, repos = "https://cloud.r-project.org")
+}
+
+library(tidyverse)
+library(lubridate)
+library(data.table)
+```
+
+Beneficiary and Inpatient are small enough to read whole with `readr`.
+Outpatient (75 columns, 780K rows) and PDE (8 columns, 5.6M rows) are read
+with `data.table::fread()` and `select =` to pull only the columns this
+notebook actually uses — no reason to load 70 unused diagnosis/procedure
+columns just to compute a cost summary.
+
+```{r load-data}
+beneficiary_all <- read_csv("../Data/Clean/beneficiary_2008_2010.csv", show_col_types = FALSE)
+
+inpatient_clean <- read_csv("../Data/Clean/inpatient_claims_sample_1.csv", show_col_types = FALSE)
+
+outpatient_clean <- fread(
+  "../Data/Clean/outpatient_claims_sample_1.csv",
+  select = c("beneficiary_id", "claim_end_date", "medicare_payment_amt",
+             "beneficiary_blood_deductible_amt", "beneficiary_part_b_deductible_amt",
+             "beneficiary_part_b_coinsurance_amt", "primary_payer_paid_amt", "total_claim_amt")
+) %>%
+  as_tibble() %>%
+  mutate(claim_end_date = ymd(claim_end_date))
+
+pde_clean <- fread(
+  "../Data/Clean/prescription_drug_events_sample_1.csv",
+  select = c("beneficiary_id", "gross_drug_cost_amt")
+) %>%
+  as_tibble()
+
+cat("beneficiary_all:", nrow(beneficiary_all), "rows x", ncol(beneficiary_all), "cols\n")
+cat("inpatient_clean:", nrow(inpatient_clean), "rows x", ncol(inpatient_clean), "cols\n")
+cat("outpatient_clean (narrowed):", nrow(outpatient_clean), "rows x", ncol(outpatient_clean), "cols\n")
+cat("pde_clean (narrowed):", nrow(pde_clean), "rows x", ncol(pde_clean), "cols\n")
+```
+
+## 3. Chronic Condition Prevalence & Correlations
+
+`chronic_condition_count` (computed in the cleaning notebook) is a simple
+row-sum across the 11 `chronic_*` flags. This section shows how common each
+condition is, then *which* conditions tend to occur together. It collapses to one row per beneficiary
+first (a condition counts as present if it was ever flagged TRUE in 2008,
+2009, *or* 2010) — otherwise a chronic condition that persists across all
+three years would be counted three times for no real reason.
+
+```{r condition-setup}
+condition_cols <- c("chronic_alzheimer", "chronic_heart_failure", "chronic_kidney_disease",
+                     "chronic_cancer", "chronic_copd", "chronic_depression", "chronic_diabetes",
+                     "chronic_ischemic_heart_disease", "chronic_osteoporosis",
+                     "chronic_rheumatoid_or_osteoarthritis", "chronic_stroke_tia")
+
+bene_conditions_ever <- beneficiary_all %>%
+  group_by(beneficiary_id) %>%
+  summarise(across(all_of(condition_cols), any), .groups = "drop")
+
+cat("Unique beneficiaries across 3 years:", nrow(bene_conditions_ever), "\n")
+```
+
+### Prevalence
+
+How many beneficiaries have each condition, and what share of all
+beneficiaries that is — a sense of scale before looking at how conditions
+relate to each other.
+
+```{r condition-prevalence}
+tibble(
+  condition = condition_cols,
+  n_beneficiaries = colSums(bene_conditions_ever[condition_cols]),
+  pct_of_beneficiaries = n_beneficiaries / nrow(bene_conditions_ever) * 100
+) %>%
+  arrange(desc(n_beneficiaries)) %>%
+  knitr::kable(digits = 1, format.args = list(big.mark = ","),
+               caption = sprintf("Prevalence of each chronic condition (ever flagged in 2008-2010), out of %s beneficiaries",
+                                 format(nrow(bene_conditions_ever), big.mark = ",")))
+```
+
+### Pairwise correlations
+
+All 11 inputs are 0/1, so a Pearson correlation here is the phi coefficient
+— a standard, well-defined measure of association for binary variables.
+
+```{r condition-corr}
+cond_matrix <- bene_conditions_ever %>%
+  select(all_of(condition_cols)) %>%
+  mutate(across(everything(), as.numeric)) %>%
+  as.matrix()
+
+cor_matrix <- cor(cond_matrix)
+```
+
+```{r condition-corr-heatmap, fig.width=8.5, fig.height=7}
+cor_long <- cor_matrix %>%
+  as.data.frame() %>%
+  rownames_to_column("condition_1") %>%
+  pivot_longer(-condition_1, names_to = "condition_2", values_to = "correlation")
+
+ggplot(cor_long, aes(condition_1, condition_2, fill = correlation)) +
+  geom_tile(color = "white") +
+  geom_text(aes(label = round(correlation, 2)), size = 3) +
+  scale_fill_gradient2(low = "#2166AC", mid = "white", high = "#B2182B", midpoint = 0) +
+  theme_minimal(base_size = 10) +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1), axis.title = element_blank()) +
+  labs(title = "Chronic condition correlation matrix")
+```
+
+Worth flagging: CMS's own FAQ says disclosure-limitation synthesis distorts
+these statistics —
+*"much of the interdependence and co-variation among variables have been
+altered... univariate and multivariate statistics, such as conditional
+correlations and regression coefficients, would not be reliable."* Treat
+the prevalence figures and correlations above as a demonstration of the
+method, not as real clinical prevalence or comorbidity patterns (see Section 5
+for the same caveat applied to dollar amounts).
+
+## 4. Claim Costs by Chronic Condition
+
+This section measures the **total amount of each claim across all payers**
+(Medicare, primary payer, and beneficiary responsibility), for beneficiaries
+who carry each condition. Inpatient, Outpatient, and PDE claims are joined to
+the condition flags from Section 3 (ever flagged). The amounts are for *all*
+of a beneficiary's claims, not only claims attributable to the condition
+itself.
+
+A beneficiary with 3 conditions contributes their claims to all 3 disease
+rows below — that's deliberate (they are flagged with every one of those
+conditions), but it means claims are double- or triple-counted across
+condition rows, and the per-disease numbers are not independent samples of
+each other.
+
+**How each claim amount is built**, per Codebook Appendix 2 ("List of
+Reimbursement Variables"):
+
+| Claim type | Total claim amount (all payers) |
+|---|---|
+| Inpatient | `total_claim_amt` = `medicare_payment_amt` + `utilization_day_count` × `pass_through_per_diem_amt` + `primary_payer_paid_amt` + Part A deductible + Part A coinsurance + blood deductible |
+| Outpatient | `total_claim_amt` = `medicare_payment_amt` + `primary_payer_paid_amt` + blood deductible + Part B deductible + Part B coinsurance |
+| PDE | `gross_drug_cost_amt` (ingredient cost + dispensing fee + sales tax + vaccine administration fee) |
+
+Inpatient includes the per-diem term because it is part of Medicare's
+payment on those claims. Blank deductibles are treated as \$0 in
+`total_claim_amt`, so all inpatient claims are included. PDE's gross drug cost is already the
+total drug cost regardless of who pays, so the patient-pay amount is part of
+it and isn't added again.
+
+```{r claim-amounts}
+inpatient_claim_amts <- inpatient_clean %>%
+  select(beneficiary_id, claim_amt = total_claim_amt)
+
+outpatient_claim_amts <- outpatient_clean %>%
+  select(beneficiary_id, claim_amt = total_claim_amt)
+
+pde_claim_amts <- pde_clean %>%
+  transmute(beneficiary_id, claim_amt = as.numeric(gross_drug_cost_amt))
+```
+
+```{r condition-flags-long}
+condition_flags_long <- bene_conditions_ever %>%
+  pivot_longer(all_of(condition_cols), names_to = "condition", values_to = "has_condition") %>%
+  filter(has_condition) %>%
+  select(beneficiary_id, condition)
+
+```
+
+```{r cost-by-disease-ip-op}
+cost_ip <- condition_flags_long %>%
+  inner_join(inpatient_claim_amts, by = "beneficiary_id", relationship = "many-to-many") %>%
+  group_by(condition) %>%
+  summarise(avg_inpatient_claim_amt = mean(claim_amt, na.rm = TRUE),
+            median_inpatient_claim_amt = median(claim_amt, na.rm = TRUE),
+            n_inpatient_claims = sum(!is.na(claim_amt)), .groups = "drop")
+
+cost_op <- condition_flags_long %>%
+  inner_join(outpatient_claim_amts, by = "beneficiary_id", relationship = "many-to-many") %>%
+  group_by(condition) %>%
+  summarise(avg_outpatient_claim_amt = mean(claim_amt, na.rm = TRUE),
+            median_outpatient_claim_amt = median(claim_amt, na.rm = TRUE),
+            n_outpatient_claims = sum(!is.na(claim_amt)), .groups = "drop")
+```
+
+PDE is 5.6M rows, and joining it fans out further still (a beneficiary's
+prescriptions × however many conditions they carry), so this one uses
+`data.table` the same way Carrier Claims does in the cleaning notebook, to
+keep it fast and light on memory:
+
+```{r cost-by-disease-pde}
+cost_pde <- merge(
+  as.data.table(condition_flags_long),
+  as.data.table(pde_claim_amts),
+  by = "beneficiary_id", allow.cartesian = TRUE
+)[, .(avg_prescription_claim_amt = mean(claim_amt, na.rm = TRUE),
+      median_prescription_claim_amt = median(claim_amt, na.rm = TRUE),
+      n_prescriptions = sum(!is.na(claim_amt))), by = condition] %>%
+  as_tibble()
+```
+
+```{r cost-by-disease-combine}
+cost_by_disease <- cost_ip %>%
+  full_join(cost_op, by = "condition") %>%
+  full_join(cost_pde, by = "condition") %>%
+  arrange(desc(avg_inpatient_claim_amt))
+
+cost_by_disease %>%
+  knitr::kable(digits = 2, format.args = list(big.mark = ","),
+               caption = "Average & median total claim amount (all payers) per claim, among beneficiaries with each chronic condition")
+```
+
+## 5. Reconciling Beneficiary Annual Amounts Against Claims
+
+Do `annual_medicare_reimb_ip` / `annual_beneficiary_resp_ip` /
+`annual_primary_payer_reimb_ip` (and the OP equivalents) in the Beneficiary
+file equal what you get by summing the matching claim-level amounts for
+that beneficiary-year? The Codebook's **Appendix 2 ("List of Reimbursement
+Variables")** spells out CMS's exact derivation formulas, so this check
+uses those instead of a naive `sum(medicare_payment_amt)`:
+
+| Beneficiary variable | CMS's stated derivation (Codebook Appendix 2) |
+|---|---|
+| `annual_medicare_reimb_ip` | `medicare_payment_amt + utilization_day_count * pass_through_per_diem_amt` |
+| `annual_beneficiary_resp_ip` | `beneficiary_deductible_amt + beneficiary_part_a_coinsurance_amt + beneficiary_blood_deductible_amt` |
+| `annual_primary_payer_reimb_ip` | `primary_payer_paid_amt` |
+| `annual_medicare_reimb_op` | `medicare_payment_amt` |
+| `annual_beneficiary_resp_op` | `beneficiary_blood_deductible_amt + beneficiary_part_b_deductible_amt + beneficiary_part_b_coinsurance_amt` |
+| `annual_primary_payer_reimb_op` | `primary_payer_paid_amt` |
+
+(Carrier's equivalents are also in Appendix 2, but conditional on
+`LINE_PRCSG_IND_CD` — a per-line processing-indicator code dropped during
+the Carrier collapse in the cleaning notebook. Reconciling Carrier would
+mean re-deriving it from the raw files, which is out of scope here —
+matching what was actually asked: Inpatient and Outpatient only.)
+
+Claims are assigned to a calendar year using `claim_end_date` (raw
+`CLM_THRU_DT`), per the DUG's own footnote to Table 1: *"Year is determined
+by the claim through date."*
+
+```{r reconcile-build}
+ip_by_bene_year <- inpatient_clean %>%
+  mutate(claim_year = year(claim_end_date)) %>%
+  group_by(beneficiary_id, reference_year = claim_year) %>%
+  summarise(
+    claims_medicare_ip = sum(medicare_payment_amt + utilization_day_count * pass_through_per_diem_amt, na.rm = TRUE),
+    claims_benres_ip = sum(beneficiary_deductible_amt + beneficiary_part_a_coinsurance_amt + beneficiary_blood_deductible_amt, na.rm = TRUE),
+    claims_pppymt_ip = sum(primary_payer_paid_amt, na.rm = TRUE),
+    .groups = "drop"
+  )
+
+op_by_bene_year <- outpatient_clean %>%
+  mutate(claim_year = year(claim_end_date)) %>%
+  group_by(beneficiary_id, reference_year = claim_year) %>%
+  summarise(
+    claims_medicare_op = sum(medicare_payment_amt, na.rm = TRUE),
+    claims_benres_op = sum(beneficiary_blood_deductible_amt + beneficiary_part_b_deductible_amt + beneficiary_part_b_coinsurance_amt, na.rm = TRUE),
+    claims_pppymt_op = sum(primary_payer_paid_amt, na.rm = TRUE),
+    .groups = "drop"
+  )
+
+reconcile <- beneficiary_all %>%
+  select(beneficiary_id, reference_year,
+         annual_medicare_reimb_ip, annual_beneficiary_resp_ip, annual_primary_payer_reimb_ip,
+         annual_medicare_reimb_op, annual_beneficiary_resp_op, annual_primary_payer_reimb_op) %>%
+  left_join(ip_by_bene_year, by = c("beneficiary_id", "reference_year")) %>%
+  left_join(op_by_bene_year, by = c("beneficiary_id", "reference_year")) %>%
+  mutate(across(starts_with("claims_"), ~ replace_na(.x, 0)))
+```
+
+```{r reconcile-summary}
+tibble(
+  component = c("Inpatient: Medicare reimbursement", "Inpatient: beneficiary responsibility",
+                "Inpatient: primary payer", "Outpatient: Medicare reimbursement",
+                "Outpatient: beneficiary responsibility", "Outpatient: primary payer"),
+  beneficiary_file_total = c(sum(reconcile$annual_medicare_reimb_ip), sum(reconcile$annual_beneficiary_resp_ip),
+                             sum(reconcile$annual_primary_payer_reimb_ip), sum(reconcile$annual_medicare_reimb_op),
+                             sum(reconcile$annual_beneficiary_resp_op), sum(reconcile$annual_primary_payer_reimb_op)),
+  claims_derived_total = c(sum(reconcile$claims_medicare_ip), sum(reconcile$claims_benres_ip),
+                           sum(reconcile$claims_pppymt_ip), sum(reconcile$claims_medicare_op),
+                           sum(reconcile$claims_benres_op), sum(reconcile$claims_pppymt_op))
+) %>%
+  knitr::kable(digits = 2, format.args = list(big.mark = ","),
+               caption = "Annual totals (Beneficiary file) vs. claims-derived totals, 2008-2010")
+```
+
+```{r reconcile-mismatch}
+tol <- 0.005
+tibble(
+  component = c("Inpatient: Medicare reimbursement", "Inpatient: beneficiary responsibility",
+                "Inpatient: primary payer", "Outpatient: Medicare reimbursement",
+                "Outpatient: beneficiary responsibility", "Outpatient: primary payer"),
+  beneficiary_years_differing = c(
+    sum(abs(reconcile$annual_medicare_reimb_ip - reconcile$claims_medicare_ip) > tol, na.rm = TRUE),
+    sum(abs(reconcile$annual_beneficiary_resp_ip - reconcile$claims_benres_ip) > tol, na.rm = TRUE),
+    sum(abs(reconcile$annual_primary_payer_reimb_ip - reconcile$claims_pppymt_ip) > tol, na.rm = TRUE),
+    sum(abs(reconcile$annual_medicare_reimb_op - reconcile$claims_medicare_op) > tol, na.rm = TRUE),
+    sum(abs(reconcile$annual_beneficiary_resp_op - reconcile$claims_benres_op) > tol, na.rm = TRUE),
+    sum(abs(reconcile$annual_primary_payer_reimb_op - reconcile$claims_pppymt_op) > tol, na.rm = TRUE)),
+  beneficiary_years_na_in_beneficiary_file = c(
+    sum(is.na(reconcile$annual_medicare_reimb_ip)), sum(is.na(reconcile$annual_beneficiary_resp_ip)),
+    sum(is.na(reconcile$annual_primary_payer_reimb_ip)), sum(is.na(reconcile$annual_medicare_reimb_op)),
+    sum(is.na(reconcile$annual_beneficiary_resp_op)), sum(is.na(reconcile$annual_primary_payer_reimb_op)))
+) %>%
+  knitr::kable(format.args = list(big.mark = ","),
+               caption = "Beneficiary-years where the Beneficiary file value differs from the claims-derived value (tolerance of half a cent), and where it is NA")
+```
+
+### Why they match — a finding worth flagging
+
+**Going in, the expectation (based on the DUG's general synthesis
+methodology) was that these *wouldn't* reconcile.** Section 6 ("Methodology
+and Limitation") of the Data User's Guide describes each synthetic
+beneficiary starting from a real "seed," with *"the claims from the seed
+beneficiary... replaced with claims from other donor beneficiary claims
+sets"* — donor substitution that would normally decouple a beneficiary's
+summary totals from whatever claims ended up attached to their synthetic
+ID.
+
+**The actual result above is the opposite: an exact match.** For all six
+components, the Beneficiary file's annual total equals the claims-derived
+total (e.g., Medicare reimbursement of \$`r format(round(sum(reconcile$annual_medicare_reimb_ip)), big.mark = ",")` for Inpatient and
+\$`r format(round(sum(reconcile$annual_medicare_reimb_op)), big.mark = ",")` for Outpatient, to the dollar). The reason is in the Codebook's **Appendix 2 ("List of
+Reimbursement Variables")** used to build the formulas in the table above:
+it defines `MEDREIMB_IP`, `BENRES_IP`, `PPPYMT_IP`, etc. as literal sums
+*over the claim-level fields*, not as an independently-donor-sourced
+figure. That strongly suggests CMS computed the six annual columns tested
+here (Inpatient and Outpatient; the three Carrier columns were not tested)
+*after* finalizing the synthetic claims for a given release, as a rollup of
+those exact synthetic claims — so they're internally consistent with this
+extract's Inpatient/Outpatient files by construction, not by coincidence.
+
+This is a narrower guarantee than it might look, though: the donor
+substitution the DUG describes still applies to *other* Beneficiary fields
+— demographics, and especially the chronic-condition flags behind Sections
+3–4 — which aren't derived from the claims files the same way and carry no
+such reconciliation guarantee. CMS's FAQ underscores that distinction
+directly: *"much of the interdependence and co-variation among
+variables have been altered... conditional correlations... would not be
+reliable."* Read as: the dollar totals tie out; the relationships between
+conditions, demographics, and cost don't necessarily.
+
+Sources: CMS *DE-SynPUF Data User's Guide*, Section 6 ("Methodology and
+Limitation"), `Docs/synpuf_dug.pdf`; CMS *DE-SynPUF Codebook*, Appendix 2
+("List of Reimbursement Variables"), `Docs/de10_codebook.pdf`; CMS *DE-SynPUF
+FAQ*, `Docs/de10_faq.pdf`.
+
+## 6. Things to note
+
+- The reconciliation in Section 5 came back an **exact match** for
+  Inpatient and Outpatient — the opposite of what the DUG's general
+  donor-substitution methodology predicted going in, and traceable instead
+  to the Codebook's Appendix 2 defining these annual fields as literal sums
+  over this release's claims. That guarantee is specific to the six annual
+  reimbursement columns tested (Inpatient and Outpatient; the three Carrier
+  columns were not tested), though — it says nothing about the chronic
+  condition flags (Sections 3–4) or demographics, which follow the more
+  general donor-substitution path the DUG describes and carry no such
+  reconciliation guarantee.
+- `cost_by_disease` (Section 4) double/triple-counts claims across comorbid
+  conditions by design (see that section) — don't sum the claim-count
+  columns (`n_*`) across rows expecting them to equal total claim counts.
+- Treat the condition prevalence and correlations (Section 3) and cost-by-disease
+  breakdown (Section 4) as a demonstration of the pipeline and methodology,
+  not as clinical or actuarial fact — both rest on relationships CMS's own
+  FAQ warns were altered by the disclosure-limitation synthesis.
+- Extending the reconciliation to Carrier would require re-deriving
+  `LINE_PRCSG_IND_CD`-filtered sums from the raw Carrier files, since that
+  column was dropped during cleaning — not done here since it wasn't asked
+  for, but the formulas are in Codebook Appendix 2 if needed later.
